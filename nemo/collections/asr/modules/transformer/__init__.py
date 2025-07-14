@@ -32,6 +32,7 @@ from nemo.collections.asr.modules.transformer.transformer_generators import (
 )
 from nemo.collections.asr.modules.transformer.transformer_modules import AttentionBridge, TransformerEmbedding
 from nemo.collections.asr.modules.transformer.transformer_utils import get_nemo_transformer
+from nemo.collections.asr.modules.transformer.transformer_decoder_asr import TransformerDecoderASR
 
 __all__ = [
     "BridgeEncoder",
@@ -51,4 +52,5 @@ __all__ = [
     "AttentionBridge",
     "TransformerEmbedding",
     "get_nemo_transformer",
+    "TransformerDecoderASR",
 ]

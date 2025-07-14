@@ -1,0 +1,194 @@
+# Configuration for training a streaming cache-aware Conformer-Transformer ASR model
+# This model uses Conformer encoder with Transformer decoder for streaming ASR applications
+
+name: "Conformer-Transformer-BPE-Streaming"
+
+model:
+  sample_rate: 16000
+  log_prediction: true # enables logging sample predictions during training
+  
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16 # adjust based on your GPU memory
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 16.7 # adjust for your dataset
+    min_duration: 0.1
+    # tarred datasets
+    is_tarred: false
+    tarred_audio_filepaths: null
+    shuffle_n: 2048
+    # bucketing params
+    bucketing_strategy: "synced_randomized"
+    bucketing_batch_size: null
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: true
+    num_workers: 8
+    pin_memory: true
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: true
+    num_workers: 8
+    pin_memory: true
+
+  # Tokenizer configuration
+  tokenizer:
+    dir: ???  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (wpe)
+    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+
+  # Audio preprocessor
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "NA" # No normalization for streaming
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 80
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  # Spec augmentation
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  # Conformer encoder configuration
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1 # default to d_model
+    n_layers: 17
+    d_model: 512
+
+    # Sub-sampling params
+    subsampling: striding # vggnet, striding, stacking, stacking_norm, or dw_striding
+    subsampling_factor: 4 # must be power of 2
+    subsampling_conv_channels: -1 # -1 sets it to d_model
+    causal_downsampling: true # required for streaming
+
+    # Feed forward module's params
+    ff_expansion_factor: 4
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos # rel_pos or abs_pos
+    n_heads: 8
+
+    # Attention context configuration for chunked limited style
+    # [left_context, right_context] - left context needs to be divisible by (right_context + 1)
+    att_context_size: [140, 27] # -1 means unlimited context
+    att_context_style: chunked_limited # required for cache-aware streaming
+    att_context_probs: null
+
+    xscaling: true # scales up the input embeddings by sqrt(d_model)
+    untie_biases: true # unties the biases of the TransformerXL layers
+    pos_emb_max_len: 5000
+
+    # Convolution module's params
+    conv_kernel_size: 31
+    conv_norm_type: 'layer_norm' # batch_norm or layer_norm
+    conv_context_size: causal # required for streaming
+
+    ### regularization
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    # stochastic depth
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  # Transformer decoder configuration
+  decoder:
+    _target_: nemo.collections.asr.models.conformer_transformer_models.TransformerDecoder
+    d_model: ${model.encoder.d_model}
+    n_layers: 6
+    n_heads: 8
+    d_ff: 2048
+    dropout: 0.1
+    max_seq_length: 5000
+
+  # Streaming configuration
+  streaming:
+    chunk_size: 0.5 # seconds per chunk
+    local_agreement_threshold: 0.5 # threshold for local agreement
+    max_decode_length: 100 # maximum tokens per chunk
+    use_cache: true # enable key-value caching
+
+  # Loss configuration
+  loss:
+    _target_: torch.nn.CrossEntropyLoss
+    reduction: mean
+
+  # Optimizer configuration
+  optim:
+    name: adamw
+    lr: 2.0
+    # optimizer arguments
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    # scheduler setup
+    sched:
+      name: NoamAnnealing
+      d_model: ${model.encoder.d_model}
+      # scheduler config override
+      warmup_steps: 10000
+      min_lr: 1e-6
+
+trainer:
+  devices: -1 # number of GPUs, -1 would use all available GPUs
+  num_nodes: 1
+  max_epochs: 1000
+  max_steps: -1 # computed at runtime if not set
+  val_check_interval: 1.0 # Set to 0.25 to check 4 times per epoch
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: 32 # 16, 32, or bf16
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_loss"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True
+
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
