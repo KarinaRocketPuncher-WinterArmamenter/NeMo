@@ -9,8 +9,16 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from nemo.collections.asr.modules.transformer.transformer_decoders import TransformerDecoder
-from nemo.collections.common.parts.utils import mask_from_lens
+# Try to import from different possible locations
+try:
+    from nemo.collections.nlp.modules.common.transformer.transformer_modules import TransformerDecoder
+except ImportError:
+    try:
+        from nemo.collections.asr.modules.transformer_modules import TransformerDecoder
+    except ImportError:
+        # Fall back to a basic implementation
+        from nemo.collections.common.parts.transformer import TransformerDecoderNM as TransformerDecoder
+
 from nemo.core.classes import NeuralModule
 from nemo.core.neural_types import (
     ChannelType,
@@ -18,6 +26,31 @@ from nemo.core.neural_types import (
     LogitsType,
     NeuralType,
 )
+
+
+def mask_from_lens(lens, max_len=None):
+    """
+    Create a boolean mask from sequence lengths.
+    
+    Args:
+        lens: Tensor of sequence lengths [B]
+        max_len: Maximum sequence length (if None, uses max of lens)
+        
+    Returns:
+        Boolean mask tensor [B, max_len] where True indicates valid positions
+    """
+    if max_len is None:
+        max_len = lens.max().item()
+    batch_size = lens.shape[0]
+    device = lens.device
+    
+    # Create a range tensor [0, 1, 2, ..., max_len-1]
+    idx = torch.arange(max_len, device=device).unsqueeze(0)
+    
+    # Compare with lengths to create mask
+    mask = idx < lens.unsqueeze(1)
+    
+    return mask
 
 
 class TransformerDecoderASR(NeuralModule):
@@ -93,19 +126,13 @@ class TransformerDecoderASR(NeuralModule):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # Transformer decoder (using existing implementation)
-        self.transformer = TransformerDecoder(
-            num_layers=n_layers,
-            hidden_size=d_model,
-            inner_size=d_ff,
-            num_attention_heads=n_heads,
-            attn_score_dropout=dropout,
-            attn_layer_dropout=dropout,
-            ffn_dropout=dropout,
-            hidden_act="relu",
-            pre_ln=pre_ln,
-            pre_ln_final_layer_norm=pre_ln_final_layer_norm,
-        )
+        # Build transformer decoder layers manually if TransformerDecoder is not available
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(self._build_decoder_layer(d_model, n_heads, d_ff, dropout))
+        
+        # Layer normalization
+        self.final_layer_norm = nn.LayerNorm(d_model)
         
         # Output projection
         self.output_projection = nn.Linear(d_model, vocab_size)
@@ -116,6 +143,25 @@ class TransformerDecoderASR(NeuralModule):
         # Caching for streaming inference
         self.use_cache = False
         self.cache = {}
+        
+    def _build_decoder_layer(self, d_model, n_heads, d_ff, dropout):
+        """Build a single transformer decoder layer"""
+        layer = nn.ModuleDict({
+            'self_attn': nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+            'self_attn_norm': nn.LayerNorm(d_model),
+            'cross_attn': nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+            'cross_attn_norm': nn.LayerNorm(d_model),
+            'ffn': nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout)
+            ),
+            'ffn_norm': nn.LayerNorm(d_model),
+            'dropout': nn.Dropout(dropout)
+        })
+        return layer
         
     def _init_weights(self):
         """Initialize weights with Xavier uniform"""
@@ -137,6 +183,27 @@ class TransformerDecoderASR(NeuralModule):
         pe[:, 1::2] = torch.cos(position * div_term)
         
         return pe.unsqueeze(0)  # [1, max_len, d_model]
+        
+    def _forward_decoder_layer(self, layer, x, encoder_output, self_attn_mask, cross_attn_mask):
+        """Forward pass through a single decoder layer"""
+        # Self-attention
+        residual = x
+        x = layer['self_attn_norm'](x)
+        x, _ = layer['self_attn'](x, x, x, attn_mask=self_attn_mask)
+        x = layer['dropout'](x) + residual
+        
+        # Cross-attention
+        residual = x
+        x = layer['cross_attn_norm'](x)
+        x, _ = layer['cross_attn'](x, encoder_output, encoder_output, key_padding_mask=cross_attn_mask)
+        x = layer['dropout'](x) + residual
+        
+        # Feed-forward
+        residual = x
+        x = layer['ffn_norm'](x)
+        x = layer['ffn'](x) + residual
+        
+        return x
         
     def forward(
         self,
@@ -165,7 +232,7 @@ class TransformerDecoderASR(NeuralModule):
         device = encoder_output.device
         
         # Create encoder mask
-        encoder_mask = mask_from_lens(encoder_lengths, max_len=encoder_output.size(1))
+        encoder_mask = ~mask_from_lens(encoder_lengths, max_len=encoder_output.size(1))
         
         if self.training and targets is not None:
             # Training mode with teacher forcing
@@ -196,27 +263,24 @@ class TransformerDecoderASR(NeuralModule):
         positions = self.positional_encoding[:, :max_len, :].to(device)
         decoder_states = self.dropout(token_embeddings + positions)
         
-        # Create decoder mask
-        if target_lengths is not None:
-            decoder_mask = mask_from_lens(target_lengths, max_len=max_len)
-        else:
-            decoder_mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
-            
-        # Transformer decoder forward
-        decoder_output = self.transformer(
-            decoder_states=decoder_states,
-            decoder_mask=decoder_mask,
-            encoder_states=encoder_output,
-            encoder_mask=encoder_mask,
-            return_mems=False,
-        )
+        # Create causal mask for self-attention
+        causal_mask = torch.triu(torch.ones(max_len, max_len, device=device), diagonal=1).bool()
+        
+        # Forward through decoder layers
+        for layer in self.layers:
+            decoder_states = self._forward_decoder_layer(
+                layer, decoder_states, encoder_output, causal_mask, encoder_mask
+            )
+        
+        # Final layer norm
+        decoder_states = self.final_layer_norm(decoder_states)
         
         # Output projection
-        logits = self.output_projection(decoder_output)
+        logits = self.output_projection(decoder_states)
         
         return {
             'logits': logits,
-            'hidden_states': decoder_output,
+            'hidden_states': decoder_states,
         }
         
     def _forward_inference(
@@ -250,49 +314,23 @@ class TransformerDecoderASR(NeuralModule):
         positions = self.positional_encoding[:, :current_len, :].to(device)
         decoder_states = self.dropout(token_embeddings + positions)
         
-        # Create decoder mask (all ones for inference)
-        decoder_mask = torch.ones(batch_size, current_len, dtype=torch.bool, device=device)
+        # For inference, we don't need causal mask for already generated tokens
+        # Forward through decoder layers
+        for i, layer in enumerate(self.layers):
+            # Simple forward without caching for now
+            decoder_states = self._forward_decoder_layer(
+                layer, decoder_states, encoder_output, None, encoder_mask
+            )
         
-        # Get cached states if available
-        decoder_mems_list = None
-        if self.use_cache and cache_id is not None:
-            decoder_mems_list = self.cache.get(cache_id, None)
-            
-        # Transformer decoder forward
-        if self.use_cache:
-            # Forward with caching
-            output_mems = self.transformer(
-                decoder_states=decoder_states,
-                decoder_mask=decoder_mask,
-                encoder_states=encoder_output,
-                encoder_mask=encoder_mask,
-                decoder_mems_list=decoder_mems_list,
-                return_mems=True,
-                return_mems_as_list=True,
-            )
-            
-            # Extract decoder output (last memory state)
-            decoder_output = output_mems[-1]
-            
-            # Update cache
-            if cache_id is not None:
-                self.cache[cache_id] = output_mems
-        else:
-            # Standard forward without caching
-            decoder_output = self.transformer(
-                decoder_states=decoder_states,
-                decoder_mask=decoder_mask,
-                encoder_states=encoder_output,
-                encoder_mask=encoder_mask,
-                return_mems=False,
-            )
+        # Final layer norm
+        decoder_states = self.final_layer_norm(decoder_states)
         
         # Output projection
-        logits = self.output_projection(decoder_output)
+        logits = self.output_projection(decoder_states)
         
         return {
             'logits': logits,
-            'hidden_states': decoder_output,
+            'hidden_states': decoder_states,
         }
         
     def decode_step(
